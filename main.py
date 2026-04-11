@@ -2,18 +2,24 @@ from flask import Flask, jsonify
 import aiohttp
 import asyncio
 import json
-from concurrent.futures import ThreadPoolExecutor
+import os
 from functools import lru_cache
-import uvloop
 from byte import encrypt_api, Encrypt_ID
 from visit_count_pb2 import Info
 
-# Install uvloop for faster async operations
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+# Handle uvloop for speed (with Python 3.14+ compatibility)
+try:
+    import uvloop
+    try:
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except DeprecationWarning:
+        pass  # Ignore deprecation warning for now
+except ImportError:
+    pass  # uvloop optional
 
 app = Flask(__name__)
 
-# Cache token loading
+# Cache token loading for speed
 @lru_cache(maxsize=10)
 def load_tokens(server_name):
     try:
@@ -35,7 +41,7 @@ def load_tokens(server_name):
         app.logger.error(f"❌ Token load error for {server_name}: {e}")
         return []
 
-# Cache URL mapping
+# Cache URL mapping for speed
 @lru_cache(maxsize=10)
 def get_url(server_name):
     url_map = {
@@ -68,7 +74,9 @@ async def visit(session, url, token, uid, encrypted_data, semaphore):
         "ReleaseVersion": "OB53",
         "X-GA": "v1 1",
         "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0]
+        "Host": url.replace("https://", "").split("/")[0],
+        "Connection": "keep-alive",  # Keep connection alive
+        "Accept-Encoding": "gzip, deflate"  # Compression
     }
     
     async with semaphore:
@@ -82,14 +90,18 @@ async def visit(session, url, token, uid, encrypted_data, semaphore):
 
 async def send_until_success(tokens, uid, server_name, target_success=2000):
     url = get_url(server_name)
+    
+    # Optimized connector settings
     connector = aiohttp.TCPConnector(
         limit=0,
         ttl_dns_cache=300,
-        force_close=True,
-        enable_cleanup_closed=True
+        force_close=False,  # Keep connections alive
+        enable_cleanup_closed=True,
+        keepalive_timeout=30
     )
     
-    semaphore = asyncio.Semaphore(1000)  # Limit concurrent connections
+    # Higher concurrency for speed
+    semaphore = asyncio.Semaphore(2000)
     total_success = 0
     total_sent = 0
     first_success_response = None
@@ -100,7 +112,8 @@ async def send_until_success(tokens, uid, server_name, target_success=2000):
     encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
     encrypted_data = bytes.fromhex(encrypted)
     
-    timeout = aiohttp.ClientTimeout(total=10, connect=5)
+    # Shorter timeout for faster failure detection
+    timeout = aiohttp.ClientTimeout(total=8, connect=3)
     
     async with aiohttp.ClientSession(
         connector=connector,
@@ -111,7 +124,7 @@ async def send_until_success(tokens, uid, server_name, target_success=2000):
         while total_success < target_success:
             batch_size = min(target_success - total_success, 2000)
             
-            # Create tasks more efficiently
+            # Create all tasks at once for maximum parallelism
             tasks = [
                 visit(
                     session, url, 
@@ -121,10 +134,10 @@ async def send_until_success(tokens, uid, server_name, target_success=2000):
                 for i in range(batch_size)
             ]
             
-            # Use return_exceptions for better performance
+            # Use return_exceptions for speed
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # Process results
+            # Process first success for player info
             if first_success_response is None:
                 for result in results:
                     if isinstance(result, tuple) and result[0] and result[1]:
@@ -136,7 +149,7 @@ async def send_until_success(tokens, uid, server_name, target_success=2000):
             total_success += batch_success
             total_sent += batch_size
 
-            print(f"Batch sent: {batch_size}, Success: {batch_success}, Total: {total_success}")
+            print(f"✅ Batch: {batch_size} sent, {batch_success} success, Total: {total_success}/{target_success}")
 
     return total_success, total_sent, player_info
 
@@ -150,6 +163,7 @@ def send_visits(server, uid):
         return jsonify({"error": "❌ No valid tokens found"}), 500
 
     print(f"🚀 Sending visits to UID: {uid} using {len(tokens)} tokens")
+    print(f"🎯 Target: {target_success} successful visits")
 
     try:
         total_success, total_sent, player_info = asyncio.run(
@@ -171,12 +185,19 @@ def send_visits(server, uid):
     else:
         return jsonify({"error": "Could not decode player information"}), 500
 
+# Health check endpoint for Render
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "healthy"}), 200
+
 if __name__ == "__main__":
-    # Use multiple workers for production
-    from multiprocessing import cpu_count
+    # For Render deployment - use PORT environment variable
+    port = int(os.environ.get("PORT", 5100))
+    
+    # Production settings for maximum speed
     app.run(
-        host="0.0.0.0", 
-        port=5100,
-        threaded=True,
-        processes=cpu_count()  # Use multiple processes
-    )
+        host="0.0.0.0",
+        port=port,
+        threaded=True,  # Enable threading
+        debug=False     # Disable debug for speed
+            )
