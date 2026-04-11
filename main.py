@@ -3,23 +3,21 @@ import aiohttp
 import asyncio
 import json
 import os
+import sys
 from functools import lru_cache
 from byte import encrypt_api, Encrypt_ID
 from visit_count_pb2 import Info
 
-# Handle uvloop for speed (with Python 3.14+ compatibility)
+# Handle uvloop for speed (optional)
 try:
     import uvloop
-    try:
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except DeprecationWarning:
-        pass  # Ignore deprecation warning for now
-except ImportError:
-    pass  # uvloop optional
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except (ImportError, DeprecationWarning):
+    pass
 
 app = Flask(__name__)
 
-# Cache token loading for speed
+# Cache token loading
 @lru_cache(maxsize=10)
 def load_tokens(server_name):
     try:
@@ -38,10 +36,10 @@ def load_tokens(server_name):
         tokens = [item["token"] for item in data if item.get("token") not in ["", "N/A", None]]
         return tokens
     except Exception as e:
-        app.logger.error(f"❌ Token load error for {server_name}: {e}")
+        print(f"❌ Token load error for {server_name}: {e}")
         return []
 
-# Cache URL mapping for speed
+# Cache URL mapping
 @lru_cache(maxsize=10)
 def get_url(server_name):
     url_map = {
@@ -66,7 +64,7 @@ def parse_protobuf_response(response_data):
             "level": info.AccountInfo.Levels or 0
         }
     except Exception as e:
-        app.logger.error(f"❌ Protobuf parsing error: {e}")
+        print(f"❌ Protobuf parsing error: {e}")
         return None
 
 async def visit(session, url, token, uid, encrypted_data, semaphore):
@@ -75,8 +73,8 @@ async def visit(session, url, token, uid, encrypted_data, semaphore):
         "X-GA": "v1 1",
         "Authorization": f"Bearer {token}",
         "Host": url.replace("https://", "").split("/")[0],
-        "Connection": "keep-alive",  # Keep connection alive
-        "Accept-Encoding": "gzip, deflate"  # Compression
+        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip, deflate"
     }
     
     async with semaphore:
@@ -91,29 +89,25 @@ async def visit(session, url, token, uid, encrypted_data, semaphore):
 async def send_until_success(tokens, uid, server_name, target_success=2000):
     url = get_url(server_name)
     
-    # Optimized connector settings
     connector = aiohttp.TCPConnector(
-        limit=0,
+        limit=100,  # Lower limit for Render's resources
         ttl_dns_cache=300,
-        force_close=False,  # Keep connections alive
+        force_close=False,
         enable_cleanup_closed=True,
         keepalive_timeout=30
     )
     
-    # Higher concurrency for speed
-    semaphore = asyncio.Semaphore(2000)
+    semaphore = asyncio.Semaphore(500)  # Lower concurrency for stability
     total_success = 0
     total_sent = 0
     first_success_response = None
     player_info = None
     token_len = len(tokens)
     
-    # Pre-encrypt data once
     encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
     encrypted_data = bytes.fromhex(encrypted)
     
-    # Shorter timeout for faster failure detection
-    timeout = aiohttp.ClientTimeout(total=8, connect=3)
+    timeout = aiohttp.ClientTimeout(total=10, connect=5)
     
     async with aiohttp.ClientSession(
         connector=connector,
@@ -122,9 +116,8 @@ async def send_until_success(tokens, uid, server_name, target_success=2000):
     ) as session:
         
         while total_success < target_success:
-            batch_size = min(target_success - total_success, 2000)
+            batch_size = min(target_success - total_success, 1000)  # Smaller batches
             
-            # Create all tasks at once for maximum parallelism
             tasks = [
                 visit(
                     session, url, 
@@ -134,10 +127,8 @@ async def send_until_success(tokens, uid, server_name, target_success=2000):
                 for i in range(batch_size)
             ]
             
-            # Use return_exceptions for speed
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # Process first success for player info
             if first_success_response is None:
                 for result in results:
                     if isinstance(result, tuple) and result[0] and result[1]:
@@ -150,8 +141,13 @@ async def send_until_success(tokens, uid, server_name, target_success=2000):
             total_sent += batch_size
 
             print(f"✅ Batch: {batch_size} sent, {batch_success} success, Total: {total_success}/{target_success}")
+            sys.stdout.flush()  # Force log output for Render
 
     return total_success, total_sent, player_info
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({"status": "API is running", "usage": "/<server>/<uid>"}), 200
 
 @app.route('/<string:server>/<int:uid>', methods=['GET'])
 def send_visits(server, uid):
@@ -163,13 +159,15 @@ def send_visits(server, uid):
         return jsonify({"error": "❌ No valid tokens found"}), 500
 
     print(f"🚀 Sending visits to UID: {uid} using {len(tokens)} tokens")
-    print(f"🎯 Target: {target_success} successful visits")
+    sys.stdout.flush()
 
     try:
         total_success, total_sent, player_info = asyncio.run(
             send_until_success(tokens, uid, server, target_success)
         )
     except Exception as e:
+        print(f"❌ Error: {e}")
+        sys.stdout.flush()
         return jsonify({"error": f"Execution error: {str(e)}"}), 500
 
     if player_info:
@@ -185,19 +183,15 @@ def send_visits(server, uid):
     else:
         return jsonify({"error": "Could not decode player information"}), 500
 
-# Health check endpoint for Render
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "healthy"}), 200
-
+# CRITICAL: Bind to PORT environment variable
 if __name__ == "__main__":
-    # For Render deployment - use PORT environment variable
-    port = int(os.environ.get("PORT", 5100))
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🚀 Starting server on port {port}")
+    sys.stdout.flush()
     
-    # Production settings for maximum speed
     app.run(
         host="0.0.0.0",
         port=port,
-        threaded=True,  # Enable threading
-        debug=False     # Disable debug for speed
-            )
+        threaded=True,
+        debug=False
+                                   )
