@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 import aiohttp
 import asyncio
 import json
@@ -11,16 +11,13 @@ from visit_count_pb2 import Info
 
 app = Flask(__name__)
 
-# Basic home route - REQUIRED for Render health checks
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
         "status": "online",
-        "message": "API is running",
-        "endpoints": {
-            "visits": "/<server>/<uid>",
-            "example": "/IND/123456789"
-        }
+        "endpoint": "/visit/<server>/<uid>",
+        "example": "/visit/bd/14502384617",
+        "target": "50,000 visits"
     }), 200
 
 @lru_cache(maxsize=5)
@@ -31,9 +28,10 @@ def load_tokens(server_name):
             "BR": "token_br.json",
             "US": "token_br.json",
             "SAC": "token_br.json",
-            "NA": "token_br.json"
+            "NA": "token_br.json",
+            "BD": "token_bd.json"
         }
-        path = path_map.get(server_name, "token_bd.json")
+        path = path_map.get(server_name.upper(), "token_bd.json")
 
         with open(path, "r") as f:
             data = json.load(f)
@@ -46,6 +44,7 @@ def load_tokens(server_name):
         return []
 
 def get_url(server_name):
+    server = server_name.upper()
     url_map = {
         "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
         "BR": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
@@ -53,7 +52,7 @@ def get_url(server_name):
         "SAC": "https://client.us.freefiremobile.com/GetPlayerPersonalShow",
         "NA": "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
     }
-    return url_map.get(server_name, "https://clientbp.ggblueshark.com/GetPlayerPersonalShow")
+    return url_map.get(server, "https://clientbp.ggblueshark.com/GetPlayerPersonalShow")
 
 def parse_protobuf_response(response_data):
     try:
@@ -84,7 +83,7 @@ async def visit(session, url, token, data):
     except:
         return False, None
 
-async def send_visits_async(tokens, uid, server_name, target=2000):
+async def send_visits_async(tokens, uid, server_name, target=50000):
     url = get_url(server_name)
     token_len = len(tokens)
     
@@ -93,9 +92,10 @@ async def send_visits_async(tokens, uid, server_name, target=2000):
     
     success = 0
     sent = 0
+    fail = 0
     player_info = None
     
-    connector = aiohttp.TCPConnector(limit=50, ssl=False)
+    connector = aiohttp.TCPConnector(limit=100, ssl=False)
     
     async with aiohttp.ClientSession(connector=connector) as session:
         while success < target:
@@ -114,34 +114,36 @@ async def send_visits_async(tokens, uid, server_name, target=2000):
                         player_info = parse_protobuf_response(resp)
                         break
             
-            batch_success = sum(1 for ok, _ in results if ok)
-            success += batch_success
-            sent += batch
+            for ok, _ in results:
+                sent += 1
+                if ok:
+                    success += 1
+                else:
+                    fail += 1
             
-            print(f"Progress: {success}/{target}")
+            print(f"Progress: {success}/{target} | Failed: {fail}")
             sys.stdout.flush()
             
-            if batch_success == 0:
-                break  # Stop if no successes
+            if success == 0 and sent > 5000:
+                break
     
-    return success, sent, player_info
+    return success, sent, fail, player_info
 
-@app.route('/<string:server>/<int:uid>', methods=['GET'])
-def send_visits(server, uid):
-    start = time.time()
+@app.route('/visit/<string:server>/<int:uid>', methods=['GET'])
+def visit_endpoint(server, uid):
+    start_time = time.time()
     server = server.upper()
+    target = 50000
     
-    print(f"📥 Request: server={server}, uid={uid}")
+    print(f"📥 Visit request: server={server}, uid={uid}, target={target}")
     sys.stdout.flush()
     
     tokens = load_tokens(server)
     if not tokens:
-        return jsonify({"error": "No tokens found"}), 500
-    
-    target = int(request.args.get('count', 2000))
+        return jsonify({"error": f"No tokens found for server: {server}"}), 500
     
     try:
-        success, sent, player_info = asyncio.run(
+        success, sent, fail, player_info = asyncio.run(
             send_visits_async(tokens, uid, server, target)
         )
     except Exception as e:
@@ -149,30 +151,35 @@ def send_visits(server, uid):
         sys.stdout.flush()
         return jsonify({"error": str(e)}), 500
     
-    elapsed = round(time.time() - start, 2)
+    elapsed = round(time.time() - start_time, 2)
+    
+    response = {
+        "status": "completed",
+        "target": target,
+        "success": success,
+        "fail": fail,
+        "total_sent": sent,
+        "time_seconds": elapsed,
+        "time_minutes": round(elapsed/60, 2),
+        "success_rate": f"{round((success/sent)*100, 1)}%" if sent > 0 else "0%"
+    }
     
     if player_info:
-        return jsonify({
+        response["player"] = {
             "uid": player_info.get("uid", uid),
             "nickname": player_info.get("nickname", ""),
             "level": player_info.get("level", 0),
             "likes": player_info.get("likes", 0),
-            "region": player_info.get("region", ""),
-            "success": success,
-            "fail": target - success,
-            "time_seconds": elapsed
-        }), 200
-    else:
-        return jsonify({
-            "uid": uid,
-            "success": success,
-            "fail": target - success,
-            "time_seconds": elapsed,
-            "note": "Player info unavailable"
-        }), 200
+            "region": player_info.get("region", "")
+        }
+    
+    return jsonify(response), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    print(f"🚀 Starting on port {port}")
+    port = int(os.environ.get("PORT", 5100))
+    print(f"🚀 Server running on port {port}")
+    print(f"📌 Endpoint: http://localhost:{port}/visit/<server>/<uid>")
+    print(f"📌 Example: http://localhost:{port}/visit/bd/14502384617")
+    print(f"📌 Target: 50,000 visits per request")
     sys.stdout.flush()
     app.run(host="0.0.0.0", port=port, threaded=True)
