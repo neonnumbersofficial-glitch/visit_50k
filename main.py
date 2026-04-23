@@ -32,15 +32,25 @@ def load_tokens(server_name):
             "BD": "token_bd.json"
         }
         path = path_map.get(server_name.upper(), "token_bd.json")
+        
+        print(f"📂 Loading tokens from: {path}")
+        sys.stdout.flush()
 
         with open(path, "r") as f:
             data = json.load(f)
 
         tokens = [item["token"] for item in data if item.get("token") not in ["", "N/A", None]]
         print(f"✅ Loaded {len(tokens)} tokens for {server_name}")
+        print(f"📝 First token: {tokens[0][:20]}... (if exists)")
+        sys.stdout.flush()
         return tokens
+    except FileNotFoundError:
+        print(f"❌ File not found: {path}")
+        sys.stdout.flush()
+        return []
     except Exception as e:
         print(f"❌ Token load error: {e}")
+        sys.stdout.flush()
         return []
 
 def get_url(server_name):
@@ -65,7 +75,8 @@ def parse_protobuf_response(response_data):
             "region": info.AccountInfo.PlayerRegion or "",
             "level": info.AccountInfo.Levels or 0
         }
-    except:
+    except Exception as e:
+        print(f"❌ Protobuf parse error: {e}")
         return None
 
 async def visit(session, url, token, data):
@@ -73,58 +84,112 @@ async def visit(session, url, token, data):
         "ReleaseVersion": "OB53",
         "X-GA": "v1 1",
         "Authorization": f"Bearer {token}",
-        "Host": url.replace("https://", "").split("/")[0]
+        "Host": url.replace("https://", "").split("/")[0],
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "*/*",
+        "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; SM-G973F Build/PPR1.180610.011)"
     }
     try:
-        async with session.post(url, headers=headers, data=data, ssl=False, timeout=10) as resp:
-            if resp.status == 200:
-                return True, await resp.read()
-            return False, None
-    except:
+        async with session.post(
+            url, 
+            headers=headers, 
+            data=data, 
+            ssl=False, 
+            timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            status = resp.status
+            if status == 200:
+                response_data = await resp.read()
+                return True, response_data
+            else:
+                print(f"⚠️ HTTP {status} for token: {token[:20]}...")
+                sys.stdout.flush()
+                return False, None
+    except asyncio.TimeoutError:
+        print(f"⏱️ Timeout for token: {token[:20]}...")
+        sys.stdout.flush()
+        return False, None
+    except Exception as e:
+        print(f"❌ Request error: {e}")
+        sys.stdout.flush()
         return False, None
 
 async def send_visits_async(tokens, uid, server_name, target=50000):
     url = get_url(server_name)
     token_len = len(tokens)
     
+    print(f"🔗 URL: {url}")
+    print(f"🔑 Using {token_len} tokens")
+    print(f"👤 Target UID: {uid}")
+    sys.stdout.flush()
+    
     encrypted = encrypt_api("08" + Encrypt_ID(str(uid)) + "1801")
     data = bytes.fromhex(encrypted)
+    
+    print(f"🔐 Encrypted data: {encrypted[:50]}...")
+    sys.stdout.flush()
     
     success = 0
     sent = 0
     fail = 0
     player_info = None
     
-    connector = aiohttp.TCPConnector(limit=100, ssl=False)
+    connector = aiohttp.TCPConnector(
+        limit=50, 
+        ssl=False,
+        force_close=True
+    )
     
-    async with aiohttp.ClientSession(connector=connector) as session:
+    timeout = aiohttp.ClientTimeout(total=15, connect=10)
+    
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout
+    ) as session:
         while success < target:
-            batch = min(target - success, 200)
+            batch = min(target - success, 100)
             tasks = []
             
             for i in range(batch):
                 token = tokens[(sent + i) % token_len]
                 tasks.append(visit(session, url, token, data))
             
-            results = await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
             if player_info is None:
-                for ok, resp in results:
-                    if ok and resp:
-                        player_info = parse_protobuf_response(resp)
-                        break
+                for result in results:
+                    if isinstance(result, tuple) and result[0] and result[1]:
+                        player_info = parse_protobuf_response(result[1])
+                        if player_info:
+                            print(f"✅ Got player info: {player_info.get('nickname', 'N/A')}")
+                            sys.stdout.flush()
+                            break
             
-            for ok, _ in results:
+            batch_success = 0
+            batch_fail = 0
+            
+            for result in results:
                 sent += 1
-                if ok:
+                if isinstance(result, tuple) and result[0]:
                     success += 1
+                    batch_success += 1
                 else:
                     fail += 1
+                    batch_fail += 1
             
-            print(f"Progress: {success}/{target} | Failed: {fail}")
+            print(f"📊 Batch: {batch_success} ok, {batch_fail} fail | Total: {success}/{target}")
             sys.stdout.flush()
             
-            if success == 0 and sent > 5000:
+            # If first batch completely fails, try to debug
+            if success == 0 and sent >= 50:
+                print(f"❌ No success after {sent} attempts!")
+                print(f"🔍 Check: URL={url}, Tokens valid? Data correct?")
+                sys.stdout.flush()
+            
+            # Stop if too many failures
+            if sent > 0 and success == 0 and sent > 500:
+                print(f"🛑 Stopping: No successful visits after {sent} attempts")
+                sys.stdout.flush()
                 break
     
     return success, sent, fail, player_info
@@ -135,26 +200,33 @@ def visit_endpoint(server, uid):
     server = server.upper()
     target = 50000
     
-    print(f"📥 Visit request: server={server}, uid={uid}, target={target}")
+    print(f"\n{'='*50}")
+    print(f"📥 NEW REQUEST: server={server}, uid={uid}, target={target}")
+    print(f"{'='*50}")
     sys.stdout.flush()
     
     tokens = load_tokens(server)
     if not tokens:
-        return jsonify({"error": f"No tokens found for server: {server}"}), 500
+        return jsonify({
+            "error": f"No tokens found for server: {server}",
+            "hint": "Check if token file exists and has valid tokens"
+        }), 500
     
     try:
         success, sent, fail, player_info = asyncio.run(
             send_visits_async(tokens, uid, server, target)
         )
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f"❌ Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.stdout.flush()
         return jsonify({"error": str(e)}), 500
     
     elapsed = round(time.time() - start_time, 2)
     
     response = {
-        "status": "completed",
+        "status": "completed" if success >= target else "partial",
         "target": target,
         "success": success,
         "fail": fail,
@@ -172,14 +244,17 @@ def visit_endpoint(server, uid):
             "likes": player_info.get("likes", 0),
             "region": player_info.get("region", "")
         }
+    else:
+        response["note"] = "Player info unavailable - tokens may be invalid"
+    
+    print(f"✅ Response: {json.dumps(response, indent=2)}")
+    sys.stdout.flush()
     
     return jsonify(response), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5100))
     print(f"🚀 Server running on port {port}")
-    print(f"📌 Endpoint: http://localhost:{port}/visit/<server>/<uid>")
-    print(f"📌 Example: http://localhost:{port}/visit/bd/14502384617")
-    print(f"📌 Target: 50,000 visits per request")
+    print(f"📌 Try: http://localhost:{port}/visit/bd/14502384617")
     sys.stdout.flush()
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host="0.0.0.0", port=port, threaded=True, debug=True)
